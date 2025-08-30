@@ -42,6 +42,8 @@ import matplotlib.pyplot as plt
 from dataclasses import dataclass
 from typing import Callable, Tuple, Dict, List, Any
 
+import gpe_visualization as viz
+
 
 # -----------------------------------------------------------------------------
 # 1. System definitions
@@ -266,7 +268,103 @@ def edmdc_predict_one_step(A_phi: np.ndarray, B_phi: np.ndarray,
 
 
 # -----------------------------------------------------------------------------
-# 5. Experiment driver
+# 5. Simple predictive controller in lifted space
+# -----------------------------------------------------------------------------
+
+def _prediction_matrices(
+    A_phi: np.ndarray, B_phi: np.ndarray, C: np.ndarray, horizon: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Pre-compute lifted-space prediction matrices for a finite horizon."""
+    n_phi = A_phi.shape[0]
+    dims = C.shape[0]
+    F = np.zeros((dims * horizon, n_phi))
+    G = np.zeros((dims * horizon, horizon))
+    A_power = np.eye(n_phi)
+    for i in range(horizon):
+        A_power = A_power @ A_phi
+        F[dims * i : dims * (i + 1), :] = C @ A_power
+        for j in range(i + 1):
+            A_power_j = np.linalg.matrix_power(A_phi, i - j)
+            G[dims * i : dims * (i + 1), j] = (
+                C @ A_power_j @ B_phi
+            ).flatten()
+    return F, G
+
+
+def run_tracking_controller(
+    dyn: Callable[[np.ndarray, float], np.ndarray],
+    A_phi: np.ndarray,
+    B_phi: np.ndarray,
+    feature_fn: Callable[[np.ndarray], np.ndarray],
+    dims: int,
+    dt: float,
+    ref_traj: np.ndarray,
+    noise_seq: np.ndarray,
+    horizon: int = 10,
+    reg_u: float = 1e-3,
+    disturb_step: int = None,
+    disturb: np.ndarray = None,
+    return_traj: bool = False,
+) -> Dict[str, float]:
+    """Run a simple MPC-like controller on the Koopman model.
+
+    The controller optimises a quadratic cost over a short horizon using
+    the identified lifted-state model.  The first state component of the
+    reference trajectory is a sinusoid while other components are zero.
+    ``noise_seq`` is added to the true system dynamics to assess robustness.
+
+    Returns a dictionary with overall tracking RMSE, control energy and the
+    RMSE after a disturbance (robustness metric).  If ``return_traj`` is True
+    the full state trajectory is included in the output under the key
+    ``"traj"``.
+    """
+    n_steps = ref_traj.shape[0] - 1
+    n_phi = A_phi.shape[0]
+    C = np.zeros((dims, n_phi))
+    C[:, :dims] = np.eye(dims)
+    F, G = _prediction_matrices(A_phi, B_phi, C, horizon)
+
+    x = ref_traj[0].copy()
+    X_hist = [x.copy()]
+    U_hist = []
+    for k in range(n_steps):
+        phi0 = feature_fn(x)
+        r_seg = ref_traj[k + 1 : k + horizon + 1]
+        if r_seg.shape[0] < horizon:
+            pad = np.repeat(r_seg[-1:, :], horizon - r_seg.shape[0], axis=0)
+            r_seg = np.vstack([r_seg, pad])
+        r_stack = r_seg.reshape(-1)
+        x_pred0 = F @ phi0
+        H = G.T @ G + reg_u * np.eye(horizon)
+        b = G.T @ (r_stack - x_pred0)
+        U_seq = np.linalg.solve(H, b)
+        u = float(U_seq[0])
+        # simulate true dynamics and add noise
+        x = rk4_step(x, u, dt, dyn)
+        x += noise_seq[k]
+        if disturb_step is not None and k == disturb_step:
+            x += disturb
+        X_hist.append(x.copy())
+        U_hist.append(u)
+
+    X_hist = np.array(X_hist)
+    ref_used = ref_traj[: X_hist.shape[0]]
+    err = X_hist - ref_used
+    rmse = float(np.sqrt(np.mean(err**2)))
+    energy = float(np.sum(np.array(U_hist) ** 2))
+    if disturb_step is not None:
+        err_post = err[disturb_step + 1 :]
+        robust_rmse = float(np.sqrt(np.mean(err_post**2)))
+    else:
+        robust_rmse = rmse
+    out = {"rmse": rmse, "energy": energy, "robust": robust_rmse}
+    if return_traj:
+        out["traj"] = X_hist
+    return out
+
+
+# -----------------------------------------------------------------------------
+# 6. Experiment driver
 # -----------------------------------------------------------------------------
 
 def collect_data_a_pe(
@@ -440,6 +538,26 @@ def run_system_experiment(
     Phi_c_gpe = Phi_gpe - Phi_gpe.mean(axis=1, keepdims=True)
     Sigma_phi_gpe = (Phi_c_gpe @ Phi_c_gpe.T) / Phi_c_gpe.shape[1]
     lam_phi_gpe = float(np.linalg.eigvalsh(Sigma_phi_gpe).min())
+
+    # ---------------- Tracking control comparison ----------------
+    n_steps_ctrl = 100
+    t_ref = np.arange(n_steps_ctrl + 1) * dt
+    ref_traj = np.zeros((n_steps_ctrl + 1, dims))
+    ref_traj[:, 0] = np.sin(0.5 * t_ref)
+    noise_seq = 0.01 * np.random.randn(n_steps_ctrl, dims)
+    disturb_step = n_steps_ctrl // 2
+    disturb = 0.1 * np.random.randn(dims)
+    metrics_ape = run_tracking_controller(
+        dyn, A_phi_ape, B_phi_ape, feature_fn, dims, dt,
+        ref_traj, noise_seq, horizon=10, disturb_step=disturb_step,
+        disturb=disturb, return_traj=True,
+    )
+    metrics_gpe = run_tracking_controller(
+        dyn, A_phi_gpe, B_phi_gpe, feature_fn, dims, dt,
+        ref_traj, noise_seq, horizon=10, disturb_step=disturb_step,
+        disturb=disturb, return_traj=True,
+    )
+
     # print summary
     print(f"\n===== {system_name.upper()} SYSTEM =====")
     print("A‑PE segments (random):", len(U_ape))
@@ -447,7 +565,26 @@ def run_system_experiment(
     print(f"RMSE A‑PE: {rmse_ape:.3e}, RMSE G‑PE: {rmse_gpe:.3e}")
     print(f"λ_min(Σ_x) A‑PE: {lam_x_ape:.3e}, G‑PE: {lam_x_gpe:.3e}")
     print(f"λ_min(Σ_φ) A‑PE: {lam_phi_ape:.3e}, G‑PE: {lam_phi_gpe:.3e}")
-    # optionally plot trajectories or log histories
+    print(
+        "Tracking RMSE A‑PE: {0:.3e}, G‑PE: {1:.3e}".format(
+            metrics_ape["rmse"], metrics_gpe["rmse"]
+        )
+    )
+    print(
+        "Control energy A‑PE: {0:.3e}, G‑PE: {1:.3e}".format(
+            metrics_ape["energy"], metrics_gpe["energy"]
+        )
+    )
+    print(
+        "Post‑disturb RMSE A‑PE: {0:.3e}, G‑PE: {1:.3e}".format(
+            metrics_ape["robust"], metrics_gpe["robust"]
+        )
+    )
+    # plots
+    viz.plot_phase_portraits(system_name, X_ape, X_gpe)
+    viz.plot_lambda_history(system_name, log_gpe["lam"], gamma)
+    viz.plot_ratio_history(system_name, log_gpe["ratios"], rho0)
+    viz.plot_tracking(system_name, ref_traj, metrics_ape["traj"], metrics_gpe["traj"], dt)
 
 
 if __name__ == "__main__":
