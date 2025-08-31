@@ -5,10 +5,11 @@ from dataclasses import dataclass
 from gpe_three_systems_experiment import (
     DuffingParams, LorenzParams, VanDerPolParams,
     duffing_dynamics, lorenz_dynamics, vdp_dynamics,
-    rk4_step, collect_data_a_pe, collect_data_g_pe,
+    rk4_step, collect_data_g_pe,
     build_phi_matrix, edmdc_fit,
     poly_features_2d, poly_features_3d
 )
+from gpe_visualization import plot_mpc_results
 
 
 class PathIntegralMPC:
@@ -63,7 +64,7 @@ def run_path_integral_tracking(dyn: Callable[[np.ndarray, float], np.ndarray],
                                 dims: int, dt: float,
                                 target: np.ndarray,
                                 n_steps: int = 100,
-                                disturbance: float = 0.1) -> Tuple[float, float]:
+                                disturbance: float = 0.1) -> Tuple[float, float, np.ndarray, np.ndarray]:
     ctrl = PathIntegralMPC(A_phi, B_phi, feature_fn, dims, dt)
     x = np.random.randn(dims)
     X = [x.copy()]
@@ -76,10 +77,11 @@ def run_path_integral_tracking(dyn: Callable[[np.ndarray, float], np.ndarray],
             x += disturbance * np.random.randn(dims)
         X.append(x.copy())
     X = np.array(X)
+    U = np.array(U)
     err = X - target
     rmse = float(np.sqrt(np.mean(err**2)))
-    energy = float(np.sum(np.array(U) ** 2))
-    return rmse, energy
+    energy = float(np.sum(U ** 2))
+    return rmse, energy, X, U
 
 
 def identify_model(system: str, dt: float, segments: int = 200):
@@ -114,9 +116,10 @@ def main():
     for sys in ["duffing", "lorenz", "vdp"]:
         dyn, A_phi, B_phi, feature_fn, dims = identify_model(sys, dt)
         target = target0[:dims]
-        rmse, energy = run_path_integral_tracking(dyn, A_phi, B_phi,
-                                                 feature_fn, dims, dt,
-                                                 target)
+        rmse, energy, X_traj, U_seq = run_path_integral_tracking(
+            dyn, A_phi, B_phi, feature_fn, dims, dt, target
+        )
+        plot_mpc_results(sys, X_traj, U_seq, target, dt)
         print(f"{sys} tracking RMSE: {rmse:.3e}, control energy: {energy:.3e}")
 
 

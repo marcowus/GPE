@@ -97,3 +97,54 @@ def plot_tracking(system_name, ref_traj, traj_ape, traj_gpe, dt, save_dir="figur
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, f"{system_name}_tracking.png"), dpi=160)
     plt.close()
+
+
+def plot_mpc_results(system_name, X, U, target, dt, save_dir="figures"):
+    """Plot MPC rollout states, control, and phase portrait."""
+    save_dir = _ensure_dir(save_dir)
+    t = np.arange(X.shape[0]) * dt
+    dims = X.shape[1]
+    fig, axes = plt.subplots(dims + 1, 1, figsize=(8, 3 * (dims + 1)), sharex=True)
+    for d in range(dims):
+        ax = axes[d]
+        ax.plot(t, X[:, d], label=f"$x_{d+1}$")
+        ax.axhline(target[d], color="k", ls="--", label="target" if d == 0 else None)
+        ax.set_ylabel(f"$x_{d+1}$")
+        ax.grid(True)
+        if d == 0:
+            ax.legend()
+    ax_u = axes[-1]
+    ax_u.plot(t[:-1], U, label="u")
+    ax_u.set_ylabel("u")
+    ax_u.set_xlabel("Time (s)")
+    ax_u.grid(True)
+    fig.suptitle(f"{system_name} MPC tracking")
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    plt.savefig(os.path.join(save_dir, f"{system_name}_mpc_timeseries.png"), dpi=160)
+    plt.close(fig)
+
+    # Phase portrait
+    if dims == 2:
+        plt.figure(figsize=(5, 4))
+        plt.plot(X[:, 0], X[:, 1], "-", lw=1.5)
+        plt.plot(target[0], target[1], "r*", markersize=10)
+        plt.xlabel("$x_1$")
+        plt.ylabel("$x_2$")
+        plt.title(f"{system_name} trajectory")
+        plt.grid(True)
+        plt.axis("equal")
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, f"{system_name}_mpc_phase.png"), dpi=160)
+        plt.close()
+    elif dims == 3:
+        fig = plt.figure(figsize=(6, 5))
+        ax = fig.add_subplot(111, projection="3d")
+        ax.plot(X[:, 0], X[:, 1], X[:, 2])
+        ax.scatter(target[0], target[1], target[2], c="r", marker="*")
+        ax.set_xlabel("$x_1$")
+        ax.set_ylabel("$x_2$")
+        ax.set_zlabel("$x_3$")
+        ax.set_title(f"{system_name} trajectory")
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, f"{system_name}_mpc_phase.png"), dpi=160)
+        plt.close(fig)
