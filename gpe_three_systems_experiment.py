@@ -168,6 +168,33 @@ def choose_u_for_direction(xk: np.ndarray, omega: np.ndarray, dt: float, L: int,
 
 
 # -----------------------------------------------------------------------------
+# 2b. Poisson-disk sampling of targets
+# -----------------------------------------------------------------------------
+
+def poisson_sample_targets(
+    n_samples: int,
+    radius: float,
+    bounds: Tuple[Tuple[float, float], ...],
+    max_attempts: int = 30_000,
+) -> np.ndarray:
+    """Generate target points with approximate Poisson‑disk spacing.
+
+    This is a simple rejection sampler that draws candidates uniformly from the
+    hyper-rectangle defined by ``bounds`` and accepts them only if they are at
+    least ``radius`` away from previously accepted points.  The algorithm is
+    adequate for the modest number of samples used in these experiments.
+    """
+    samples: List[np.ndarray] = []
+    attempts = 0
+    while len(samples) < n_samples and attempts < max_attempts:
+        cand = np.array([np.random.uniform(lo, hi) for (lo, hi) in bounds])
+        if all(np.linalg.norm(cand - s) >= radius for s in samples):
+            samples.append(cand)
+        attempts += 1
+    return np.array(samples)
+
+
+# -----------------------------------------------------------------------------
 # 3. Multi‑scale non‑clustering monitor
 # -----------------------------------------------------------------------------
 
@@ -393,46 +420,95 @@ def collect_data_g_pe(
     rho0: float,
     cov_window: int = None,
     ratio_window: int = None,
+    n_targets: int = None,
+    start_states: List[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
     """
-    Collect data using geometric PE: greedily excite along weakest state direction
-    while enforcing multi‑scale non‑clustering.  Stop when lambda_min exceeds
-    gamma and ratios <= rho0 or when max_segments reached.
-    Returns X, U and a log dict (including history of lambdas and ratios).
+    Collect data using geometric PE with a target‑based strategy.  Target
+    points are drawn from a Poisson‑disk distribution and the system is greedily
+    steered toward the nearest under‑visited target.  Multi‑scale
+    non‑clustering statistics are still monitored for logging.
+
+    Parameters are largely the same as the previous version with two optional
+    additions:
+
+    - ``n_targets``: number of target points to draw.  Defaults to
+      ``max_segments``.
+    - ``start_states``: optional list of initial states to cycle through when
+      target quotas are exhausted.
+
+    Returns arrays ``X`` and ``U`` together with a log dictionary containing
+    the history of covariance eigenvalues, non‑clustering ratios, chosen targets
+    and visit counts.
     """
-    # start from random state
-    x = np.random.randn(state_dim)
+    if n_targets is None:
+        n_targets = max_segments
+    bounds = [(-rho0, rho0)] * dims
+    target_radius = L_seg * dt
+    targets = poisson_sample_targets(n_targets, target_radius, bounds)
+    target_counts = np.zeros(len(targets), dtype=int)
+    quota = max(1, int(rho0))
+
+    if start_states is None or len(start_states) == 0:
+        start_states = [np.random.randn(state_dim)]
+    else:
+        start_states = [np.asarray(s).copy() for s in start_states]
+
+    start_queue = list(start_states)
+    x = start_queue.pop(0)
     X = [x.copy()]
     U = []
     lam_hist = []
     ratio_hist: List[List[float]] = []
     u_grid = np.linspace(-p.u_max, p.u_max, 21)
-    for seg in range(1, max_segments + 1):
-        # compute cov window; if provided, use recent window
+
+    seg = 0
+    while seg < max_segments:
+        eligible = np.where(target_counts < quota)[0]
+        if eligible.size == 0:
+            if start_queue:
+                x = start_queue.pop(0)
+                X.append(x.copy())
+                continue
+            else:
+                break
+
+        dists = np.linalg.norm(targets[eligible] - x[:dims], axis=1)
+        targ_idx = eligible[np.argmin(dists)]
+        target = targets[targ_idx]
+        omega = target - x[:dims]
+        norm_omega = np.linalg.norm(omega)
+        if norm_omega < 1e-9:
+            omega = np.random.randn(dims)
+            norm_omega = np.linalg.norm(omega)
+        omega = omega / norm_omega
+
+        best_u = choose_u_for_direction(x, omega, dt, L_seg, u_grid, dyn)
+        for _ in range(L_seg):
+            x = rk4_step(x, best_u, dt, dyn)
+            X.append(x.copy())
+            U.append(best_u)
+        target_counts[targ_idx] += 1
+        seg += 1
+
         X_arr = np.array(X)
         if cov_window is not None and X_arr.shape[0] > cov_window:
             X_window = X_arr[-cov_window:]
         else:
             X_window = X_arr
-        # smallest eigen direction
-        omega = min_eig_direction(X_window)
-        # choose u
-        best_u = choose_u_for_direction(x, omega, dt, L_seg, u_grid, dyn)
-        # simulate segment
-        seg_pts = []
-        for _ in range(L_seg):
-            x = rk4_step(x, best_u, dt, dyn)
-            X.append(x.copy()); U.append(best_u)
-            seg_pts.append(x.copy())
-        # update lam and ratio
         lam_val = lambda_min_cov(np.array(X_window))
         lam_hist.append(lam_val)
         ratio_res = multiscale_ratio(np.array(X_window), dims, grid_sizes, rho0, ratio_window)
         ratio_hist.append(ratio_res["ratios"])
-        # stopping check
         if lam_val >= gamma and ratio_res["ok"]:
             break
-    log = {"lam": lam_hist, "ratios": ratio_hist}
+
+    log = {
+        "lam": lam_hist,
+        "ratios": ratio_hist,
+        "targets": targets,
+        "counts": target_counts.tolist(),
+    }
     return np.array(X), np.array(U), log
 
 
