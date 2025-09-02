@@ -383,6 +383,113 @@ def run_tracking_controller(
 
 
 # -----------------------------------------------------------------------------
+# 5b. DeePC controller using raw trajectory data
+# -----------------------------------------------------------------------------
+
+def _hankel_blocks(data: np.ndarray, L: int) -> np.ndarray:
+    """Construct a block Hankel matrix from time-series ``data``.
+
+    ``data`` has shape (rows, T).  The returned matrix has ``rows * L`` rows and
+    ``T - L + 1`` columns.  This helper is used for DeePC to build past and
+    future Hankel matrices for the input and state trajectories.
+    """
+    rows, T = data.shape
+    cols = T - L + 1
+    return np.vstack([data[:, i : i + cols] for i in range(L)])
+
+
+def run_deepc_controller(
+    dyn: Callable[[np.ndarray, float], np.ndarray],
+    X_data: np.ndarray,
+    U_data: np.ndarray,
+    dt: float,
+    ref_traj: np.ndarray,
+    noise_seq: np.ndarray,
+    Tini: int = 5,
+    horizon: int = 10,
+    reg_u: float = 1e-3,
+    reg_g: float = 1e-6,
+    disturb_step: int = None,
+    disturb: np.ndarray = None,
+    max_samples: int = 500,
+) -> Dict[str, float]:
+    """Run a DeePC controller using trajectory data.
+
+    The controller solves a quadratic program at each step using the Hankel
+    matrices built from the provided data ``X_data`` and ``U_data``.  The states
+    are treated as the measured outputs.  ``reg_u`` and ``reg_g`` are
+    regularisation terms on the control effort and optimisation variable
+    respectively.
+    """
+    # build Hankel matrices from data
+    Y_data = X_data[:-1].T  # dimensions x T
+    U_mat = U_data.reshape(1, -1)  # single-input
+    H_u = _hankel_blocks(U_mat, Tini + horizon)
+    H_y = _hankel_blocks(Y_data, Tini + horizon)
+    m = U_mat.shape[0]
+    dims = Y_data.shape[0]
+    Up = H_u[: m * Tini]
+    Uf = H_u[m * Tini :]
+    Yp = H_y[: dims * Tini]
+    Yf = H_y[dims * Tini :]
+    cols = Up.shape[1]
+    if cols > max_samples:
+        idx = np.random.choice(cols, max_samples, replace=False)
+        Up = Up[:, idx]
+        Uf = Uf[:, idx]
+        Yp = Yp[:, idx]
+        Yf = Yf[:, idx]
+    Aeq = np.vstack([Up, Yp])
+    n_g = Aeq.shape[1]
+    H = Yf.T @ Yf + reg_u * (Uf.T @ Uf) + reg_g * np.eye(n_g)
+
+    n_steps = ref_traj.shape[0] - 1
+    past_y = np.tile(ref_traj[0], (Tini, 1))
+    past_u = np.zeros((Tini, m))
+    x = ref_traj[0].copy()
+    X_hist = [x.copy()]
+    U_hist = []
+
+    for k in range(n_steps):
+        r_seg = ref_traj[k + 1 : k + horizon + 1]
+        if r_seg.shape[0] < horizon:
+            pad = np.repeat(r_seg[-1:, :], horizon - r_seg.shape[0], axis=0)
+            r_seg = np.vstack([r_seg, pad])
+        r_stack = r_seg.reshape(-1)
+
+        beq = np.concatenate([past_u.flatten(), past_y.flatten()])
+        f = -Yf.T @ r_stack
+        KKT = np.block([[H, Aeq.T], [Aeq, np.zeros((Aeq.shape[0], Aeq.shape[0]))]])
+        rhs = np.concatenate([-f, beq])
+        sol = np.linalg.solve(KKT, rhs)
+        g = sol[:n_g]
+        u_seq = Uf @ g
+        u = float(u_seq[0])
+
+        x = rk4_step(x, u, dt, dyn)
+        x += noise_seq[k]
+        if disturb_step is not None and k == disturb_step:
+            x += disturb
+        X_hist.append(x.copy())
+        U_hist.append(u)
+
+        past_u = np.vstack([past_u[1:], [[u]]])
+        past_y = np.vstack([past_y[1:], [x]])
+
+    X_hist = np.array(X_hist)
+    ref_used = ref_traj[: X_hist.shape[0]]
+    err = X_hist - ref_used
+    rmse = float(np.sqrt(np.mean(err**2)))
+    energy = float(np.sum(np.array(U_hist) ** 2))
+    if disturb_step is not None:
+        err_post = err[disturb_step + 1 :]
+        robust_rmse = float(np.sqrt(np.mean(err_post**2)))
+    else:
+        robust_rmse = rmse
+    return {"rmse": rmse, "energy": energy, "robust": robust_rmse}
+
+
+# -----------------------------------------------------------------------------
 # 6. Experiment driver
 # -----------------------------------------------------------------------------
 
@@ -625,6 +732,30 @@ def run_system_experiment(
         ref_traj, noise_seq, horizon=10, disturb_step=disturb_step,
         disturb=disturb,
     )
+    metrics_deepc_ape = run_deepc_controller(
+        dyn,
+        X_ape,
+        U_ape,
+        dt,
+        ref_traj,
+        noise_seq,
+        Tini=5,
+        horizon=10,
+        disturb_step=disturb_step,
+        disturb=disturb,
+    )
+    metrics_deepc_gpe = run_deepc_controller(
+        dyn,
+        X_gpe,
+        U_gpe,
+        dt,
+        ref_traj,
+        noise_seq,
+        Tini=5,
+        horizon=10,
+        disturb_step=disturb_step,
+        disturb=disturb,
+    )
 
     # print summary
     print(f"\n===== {system_name.upper()} SYSTEM =====")
@@ -634,18 +765,33 @@ def run_system_experiment(
     print(f"λ_min(Σ_x) A‑PE: {lam_x_ape:.3e}, G‑PE: {lam_x_gpe:.3e}")
     print(f"λ_min(Σ_φ) A‑PE: {lam_phi_ape:.3e}, G‑PE: {lam_phi_gpe:.3e}")
     print(
-        "Tracking RMSE A‑PE: {0:.3e}, G‑PE: {1:.3e}".format(
+        "Tracking RMSE (EDMDc) A‑PE: {0:.3e}, G‑PE: {1:.3e}".format(
             metrics_ape["rmse"], metrics_gpe["rmse"]
         )
     )
     print(
-        "Control energy A‑PE: {0:.3e}, G‑PE: {1:.3e}".format(
+        "Tracking RMSE (DeePC) A‑PE: {0:.3e}, G‑PE: {1:.3e}".format(
+            metrics_deepc_ape["rmse"], metrics_deepc_gpe["rmse"]
+        )
+    )
+    print(
+        "Control energy (EDMDc) A‑PE: {0:.3e}, G‑PE: {1:.3e}".format(
             metrics_ape["energy"], metrics_gpe["energy"]
         )
     )
     print(
-        "Post‑disturb RMSE A‑PE: {0:.3e}, G‑PE: {1:.3e}".format(
+        "Control energy (DeePC) A‑PE: {0:.3e}, G‑PE: {1:.3e}".format(
+            metrics_deepc_ape["energy"], metrics_deepc_gpe["energy"]
+        )
+    )
+    print(
+        "Post‑disturb RMSE (EDMDc) A‑PE: {0:.3e}, G‑PE: {1:.3e}".format(
             metrics_ape["robust"], metrics_gpe["robust"]
+        )
+    )
+    print(
+        "Post‑disturb RMSE (DeePC) A‑PE: {0:.3e}, G‑PE: {1:.3e}".format(
+            metrics_deepc_ape["robust"], metrics_deepc_gpe["robust"]
         )
     )
     # optionally plot trajectories or log histories
